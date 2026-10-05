@@ -1,0 +1,122 @@
+name: Server and Mirror Bot
+
+on:
+  workflow_dispatch:
+
+# Never run two copies at once: two bots sharing one token fight over Telegram updates.
+concurrency:
+  group: server
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install and start Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname=github-runner --accept-dns=false
+          echo "Tailscale IP: $(tailscale ip -4)"
+
+      - name: Configure SSH
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          [ -x /usr/sbin/sshd ] || sudo apt-get install -y -qq openssh-server
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PUBLIC_KEY" >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl enable --now ssh
+          echo "Connect via: ssh $(whoami)@$(tailscale ip -4)"
+
+      - name: Deploy Mirror Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API: ${{ secrets.TELEGRAM_API }}
+          TELEGRAM_HASH: ${{ secrets.TELEGRAM_HASH }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          AUTHORIZED_CHATS: ${{ secrets.AUTHORIZED_CHATS }}
+          LEECH_DUMP_CHAT: ${{ secrets.LEECH_DUMP_CHAT }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/anasty17/mirror-leech-telegram-bot mirrorbot
+          cd mirrorbot
+
+          # The bot reads config.py. Values are written with repr(), so quotes or
+          # special characters in a secret cannot break the file.
+          python3 - <<'PY'
+          import os
+
+
+          def env(name):
+              return os.environ.get(name, "").strip()
+
+
+          def number_or_text(value):
+              try:
+                  return int(value)
+              except ValueError:
+                  return value
+
+
+          config = {
+              "BOT_TOKEN": env("BOT_TOKEN"),
+              "OWNER_ID": int(env("OWNER_ID")),
+              "TELEGRAM_API": int(env("TELEGRAM_API")),
+              "TELEGRAM_HASH": env("TELEGRAM_HASH"),
+              "DATABASE_URL": "mongodb://mongodb:27017",
+              "DATABASE_NAME": "mltb",
+              "AUTHORIZED_CHATS": env("AUTHORIZED_CHATS"),
+          }
+          if env("LEECH_DUMP_CHAT"):
+              config["LEECH_DUMP_CHAT"] = number_or_text(env("LEECH_DUMP_CHAT"))
+
+          with open("config.py", "w", encoding="utf-8") as handle:
+              for key, value in config.items():
+                  handle.write(f"{key} = {value!r}\n")
+          PY
+
+          cat > docker-compose.yml <<'EOF'
+          services:
+            mongodb:
+              image: mongo:7
+              restart: always
+              volumes:
+                - mongo_data:/data/db
+            bot:
+              build: .
+              restart: always
+              depends_on:
+                - mongodb
+              volumes:
+                - ./downloads:/usr/src/app/downloads
+          volumes:
+            mongo_data:
+          EOF
+
+          docker compose up -d --build
+
+      - name: Keep runner alive
+        run: |
+          cd mirrorbot
+          echo "Bot logs are not printed here, so a public repo does not expose them."
+          echo "To read them: SSH in over Tailscale, then run: docker compose logs -f bot"
+          while true; do
+            sleep 300
+            if ! docker compose ps --status running --services | grep -qx bot; then
+              echo "Bot container is not running any more."
+              docker compose ps -a
+              exit 1
+            fi
+            echo "Heartbeat $(date -u): bot is running"
+          done
